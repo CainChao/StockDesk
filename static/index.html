@@ -69,6 +69,23 @@
     color: var(--gold); border-color: rgba(232,179,57,.5);
     background: rgba(232,179,57,.1); box-shadow: 0 0 0 1px rgba(232,179,57,.08) inset;
   }
+
+  /* ---------- 常用指数快捷条 ---------- */
+  .idx-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 20px 0; overflow-x: auto; flex: none;
+  }
+  .idx-bar::-webkit-scrollbar { height: 0; }
+  .idx-bar .lab { color: var(--muted); font-size: 12px; white-space: nowrap; margin-right: 2px; }
+  .idx-chip {
+    display: flex; align-items: center; gap: 7px; white-space: nowrap;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+    padding: 4px 10px; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .idx-chip:hover { border-color: #2f3d50; }
+  .idx-chip.on { border-color: var(--accent); background: #12203a; }
+  .idx-chip .n { font-size: 12px; }
+  .idx-chip .pc { font-size: 12px; font-variant-numeric: tabular-nums; }
   .toast {
     position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%) translateY(16px);
     background: #1a2330; border: 1px solid #2c3a4d; color: #dbe6f3; padding: 10px 18px;
@@ -250,14 +267,16 @@
     <div class="search">
       <div class="search-box">
         <input id="code" autocomplete="off" spellcheck="false"
-               placeholder="输入股票代码或名称，如 600519 / 000001 / 贵州茅台" />
+               placeholder="输入股票/指数代码或名称，如 600519 / 沪深300 / 上证指数" />
         <button id="go">查询</button>
       </div>
       <div class="suggest" id="suggest"></div>
     </div>
-    <button id="watchAdd" class="lockbtn" title="把当前股票加入自选列表；自选股会展示在托盘悬停提示中，列表内可再设置持仓股数与成本">＋ 加自选</button>
+    <button id="watchAdd" class="lockbtn" title="把当前股票/指数加入自选列表；自选会展示在托盘悬停提示中，列表内可再设置持仓股数与成本">＋ 加自选</button>
     <div class="clock" id="clock"></div>
   </header>
+
+  <section class="idx-bar" id="idxBar"><span class="lab">常用指数</span></section>
 
   <main>
     <section class="holdings" id="holdings" hidden>
@@ -352,7 +371,7 @@
 const $ = (id) => document.getElementById(id);
 const UP = '#ef4a4a', DOWN = '#22c55e', MUTED = '#8695a9', LINE = '#1f2937', GOLD = '#e8b339';
 const state = { code: 'sh000300', days: 120, tab: 'minute', quote: null, timer: null,
-                watch: { items: [], totals: {} } };
+                watch: { items: [], totals: {} }, indices: [] };
 let minuteChart, dailyChart, finChart;
 
 /* ---------------- 工具 ---------------- */
@@ -368,6 +387,15 @@ const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '--'
   : Number(v).toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d });
 const cls = (v) => v > 0 ? 'up' : v < 0 ? 'down' : 'flat';
 const signed = (v, d = 2) => (v > 0 ? '+' : '') + fmt(v, d);
+/* 代码比较：兼容 601288 / sh601288 / sh000300 等不同写法 */
+const sameCode = (a, b) => {
+  const ka = String(a || '').toLowerCase(), kb = String(b || '').toLowerCase();
+  const da = (ka.match(/^(?:sh|sz|bj)?(\d{6})$/) || [])[1];
+  const db = (kb.match(/^(?:sh|sz|bj)?(\d{6})$/) || [])[1];
+  const pa = (ka.match(/^(sh|sz|bj)/) || [''])[0];
+  const pb = (kb.match(/^(sh|sz|bj)/) || [''])[0];
+  return !!da && da === db && (!pa || !pb || pa === pb);
+};
 
 /* ---------------- 时钟 ---------------- */
 setInterval(() => {
@@ -380,7 +408,7 @@ function renderQuote(q) {
   state.quote = q;
   const c = cls(q.pct);
   $('qName').textContent = q.name;
-  $('qMarket').textContent = q.market;
+  $('qMarket').textContent = q.is_index ? '指数' : q.market;
   $('qCode').textContent = q.code + ' · ' + q.secucode;
   $('qPrice').textContent = fmt(q.price, 2);
   $('qPrice').className = 'p ' + c;
@@ -389,7 +417,17 @@ function renderQuote(q) {
   $('qTime').textContent = q.time
     ? `更新 ${q.time.slice(8, 10)}:${q.time.slice(10, 12)}:${q.time.slice(12, 14)} · 数据来源 腾讯财经/东方财富`
     : '';
-  const rows = [
+  const rows = q.is_index ? [
+    // 指数无个股财务指标，只展示价量信息
+    ['今开', fmt(q.open), q.open > q.prev_close ? 'up' : q.open < q.prev_close ? 'down' : ''],
+    ['昨收', fmt(q.prev_close), ''],
+    ['最高', fmt(q.high), q.high > q.prev_close ? 'up' : 'down'],
+    ['最低', fmt(q.low), q.low < q.prev_close ? 'down' : 'up'],
+    ['成交量', fmt(q.volume / 1e4, 2) + ' 万手', ''],
+    ['成交额', fmt(q.amount / 1e4, 2) + ' 亿', ''],
+    ['振幅', fmt(q.amplitude) + '%', ''],
+    ['涨跌点', signed(q.change), c],
+  ] : [
     ['今开', fmt(q.open), q.open > q.prev_close ? 'up' : q.open < q.prev_close ? 'down' : ''],
     ['昨收', fmt(q.prev_close), ''],
     ['最高', fmt(q.high), q.high > q.prev_close ? 'up' : 'down'],
@@ -750,12 +788,12 @@ function renderWatch() {
     const pnl = it.cost ? it.hold_pnl : it.today_pnl;
     return `<div class="h-chip" data-code="${it.code}"
       title="${it.name} ${it.code}｜股数 ${it.shares}｜成本 ${it.cost || '未填'}｜点击查看详情">
-      <span class="n">${it.name}</span>
+      <span class="n">${it.name}${it.is_index ? '<i class="tag" style="margin-left:6px">指数</i>' : ''}</span>
       <span class="c">${it.code}</span>
       <b class="p ${cls(it.pct)}">${fmt(it.price, 2)}</b>
       <span class="pc ${cls(it.pct)}">${signed(it.pct)}%</span>
       ${it.shares ? `<span class="pl ${cls(pnl)}">${money(pnl)}</span>` : ''}
-      <i class="pos" data-pos="${it.code}" title="设置该股票的持仓股数与成本价">＋持仓</i>
+      ${it.is_index ? '' : `<i class="pos" data-pos="${it.code}" title="设置该股票的持仓股数与成本价">＋持仓</i>`}
       <i class="x" data-del="${it.code}" title="从自选移除">×</i>
     </div>`;
   }).join('');
@@ -791,8 +829,8 @@ async function removeWatch(code) {
 async function quickAdd() {
   const q = state.quote;
   if (!q) { toast('请先查询一只股票'); return; }
-  const exist = (state.watch.items || []).find(i => i.code === q.code);
-  if (exist) { toast(`${q.name} 已在自选中（可在列表内点「＋持仓」设置股数）`); return; }
+  const exist = (state.watch.items || []).find(i => sameCode(i.code, q.code));
+  if (exist) { toast(`${q.name} 已在自选中（${q.is_index ? '托盘悬停可查看涨跌幅' : '可在列表内点「＋持仓」设置股数'}）`); return; }
   const url = `/api/watch?action=add&code=${q.code}&shares=0&cost=0`;
   try {
     const j = await fetch(url, { method: 'POST' }).then(r => r.json());
@@ -807,7 +845,7 @@ async function quickAdd() {
 
 /* 自选列表内「＋持仓」：为指定股票设置股数与成本 */
 function openPosDialog(code) {
-  const it = (state.watch.items || []).find(i => i.code === code);
+  const it = (state.watch.items || []).find(i => sameCode(i.code, code));
   if (!it) return;
   state.dlgCode = code;
   $('dlgStock').textContent = `${it.name} ${it.code} · 现价 ${fmt(it.price, 2)}`;
@@ -850,6 +888,30 @@ document.addEventListener('keydown', (e) => {
 
 setInterval(loadWatch, 10000);      // 自选列表随行情自动刷新
 
+/* ---------------- 常用指数快捷条 ---------------- */
+async function loadIndices() {
+  try {
+    const j = await fetch('/api/indices').then(r => r.json());
+    if (j.ok) { state.indices = j.data.items; renderIndices(); }
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderIndices() {
+  const box = $('idxBar');
+  const items = state.indices || [];
+  if (!items.length) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  box.innerHTML = '<span class="lab">常用指数</span>' + items.map(it => `
+    <div class="idx-chip${it.code === state.code ? ' on' : ''}" data-code="${it.code}"
+         title="${it.name}（${it.code}）｜点击查看分时与K线">
+      <span class="n">${it.name}</span>
+      <span class="pc ${cls(it.pct)}">${signed(it.pct)}%</span>
+    </div>`).join('');
+  box.querySelectorAll('.idx-chip').forEach(el =>
+    el.addEventListener('click', () => load(el.dataset.code)));
+}
+setInterval(loadIndices, 30000);    // 指数涨跌幅随行情刷新
+
 /* ---------------- 查询主流程 ---------------- */
 async function load(code) {
   const q = (code || '').trim();
@@ -863,6 +925,7 @@ async function load(code) {
     state.code = quote.code;
     $('code').value = quote.code;
     renderQuote(quote);
+    renderIndices();          // 高亮当前指数（若正在看指数）
     loadMinute();
     if (state.tab === 'daily') loadDaily();
     if (state.tab === 'biz') loadBiz();
@@ -915,7 +978,7 @@ input.addEventListener('input', () => {
       const d = await api('/api/suggest', { q: v });
       if (!d.items.length) { sug.style.display = 'none'; return; }
       sug.innerHTML = d.items.map((it, i) =>
-        `<div data-code="${it.full || it.code}" data-i="${i}"><span>${it.name}</span><span class="c">${it.code}</span></div>`).join('');
+        `<div data-code="${it.full || it.code}" data-i="${i}"><span>${it.name}${it.is_index ? '<i class="tag" style="margin-left:8px">指数</i>' : ''}</span><span class="c">${it.code}</span></div>`).join('');
       sug.style.display = 'block';
       sug.querySelectorAll('div').forEach(el => el.addEventListener('click', () => {
         sug.style.display = 'none';
@@ -951,12 +1014,13 @@ window.addEventListener('resize', () => {
 });
 
 /* ---------------- 启动 ---------------- */
-/* 版本自检：本页内嵌期望版本，与服务器实际版本不符说明加载到了旧缓存，
-   立即带随机参数强制跳转到服务器最新页面 */
-const EXPECTED_VERSION = '2.1.3';
+/* 版本自检：页面里的 __APP_VERSION__ 由服务器返回时注入实际版本，
+   与 /api/health 不符说明加载到了旧缓存，强制跳转刷新一次（带保护防循环） */
+const EXPECTED_VERSION = '__APP_VERSION__';
 fetch('/api/health').then(r => r.json()).then(j => {
   const sv = j && j.data && j.data.version;
-  if (sv && sv !== EXPECTED_VERSION) {
+  if (sv && sv !== EXPECTED_VERSION && !sessionStorage.getItem('sd_ver_reload')) {
+    sessionStorage.setItem('sd_ver_reload', '1');   // 只允许自愈刷新一次，杜绝无限刷新循环
     location.replace('/?v=' + sv + '&r=' + Date.now() + (location.hash || ''));
   }
 }).catch(() => {});
@@ -969,6 +1033,7 @@ $('ranges').style.visibility = 'hidden';
   // 恢复顺序：深链代码 > 自选第一只 > 默认沪深300
   // （不读"上次查看"缓存：清空自选后应回到沪深300，而不是残留的上次股票）
   let code = (h.match(/^(?:\w+\/)?(\d{6})$/) || [])[1] || '';
+  loadIndices();              // 常用指数快捷条（并行加载）
   try {
     const j = await fetch('/api/watch').then(r => r.json());
     if (j.ok) {

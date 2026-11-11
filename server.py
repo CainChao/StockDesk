@@ -45,7 +45,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     RESOURCE_DIR = BASE_DIR
 STATIC_DIR = os.path.join(RESOURCE_DIR, "static")
-APP_VERSION = "2.1.3"                # 版本号随功能更新，供 /api/health 与启动清理判断
+APP_VERSION = "2.3.1"                # 版本号随功能更新，供 /api/health 与启动清理判断
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
 
@@ -137,34 +137,101 @@ def normalize(code):
 
 # ---------------------------------------------------------------- 实时报价
 
+def _vol_plain(v):
+    """成交量紧凑展示：3.6亿 / 6820万 / 123（单位：手）。"""
+    v = v or 0.0
+    if v >= 1e8:
+        return "%.1f亿" % (v / 1e8)
+    if v >= 1e4:
+        return "%.0f万" % (v / 1e4)
+    return "%d" % int(round(v))
+
+
+def _m5_vol_by_day(tencent):
+    """取最近 5 分钟 K 线，按交易日聚合：{yyyyMMdd: [(HHMM, 成交量), ...]}（时间升序）。"""
+    url = ("https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=%s,m5,,320" % tencent)
+    data = json.loads(fetch(url))["data"][tencent]
+    days = {}
+    for b in (data.get("m5") or []):
+        try:
+            t = str(b[0])
+            if len(t) != 12:
+                continue
+            days.setdefault(t[:8], []).append((t[8:], to_num(b[5], 0) or 0.0))
+        except Exception:
+            continue
+    for k in days:
+        days[k].sort()
+    return days
+
+
+def _index_vol_yoy(tencent):
+    """指数成交量同比（%）：(今日此时点累计量 - 昨日同时点累计量) / 今日此时点累计量。
+
+    "同一时点"按 5 分钟 K 线收盘时刻对齐：只比较双方都已走完的相同时刻窗口，
+    避免盘中拿半天量去比昨天全天量。上游异常或数据不足返回 None。缓存 30 秒。
+    """
+    def build():
+        try:
+            days = _m5_vol_by_day(tencent)
+        except Exception:
+            return None
+        if len(days) < 2:
+            return None
+        keys = sorted(days)                 # 升序，keys[-1] 为最近交易日
+        today_key, prev_key = keys[-1], keys[-2]
+        today_bars = list(days[today_key])
+        # 最后一根 5 分钟 K 线可能仍在生成（标签时刻晚于当前钟点），剔除后再对比
+        now = datetime.now()
+        if today_key == now.strftime("%Y%m%d") and today_bars and \
+                today_bars[-1][0] > now.strftime("%H%M"):
+            today_bars = today_bars[:-1]
+        if not today_bars:
+            return None
+        cutoff = today_bars[-1][0]          # 今日已走完的最后一个时刻
+        cur = sum(v for _, v in today_bars)
+        prev = sum(v for hm, v in days[prev_key] if hm <= cutoff)
+        if cur <= 0 or prev <= 0:
+            return None
+        return round((cur - prev) / cur * 100, 1)
+
+    return cached("volcmp:%s" % tencent, 30, build)
+
+
 def api_quote(code):
     tencent, secucode, _ = normalize(code)
     # 输入带显式市场前缀（如 sh000300 沪深300）时，回传完整代码，
     # 避免前端回填 6 位裸代码后被再次推断成错误市场（000300 会被当成 sz）
     explicit = bool(re.match(r"^\s*(sh|sz|bj)", (code or "").strip(), re.I))
 
-    def build():
-        text = fetch("https://qt.gtimg.cn/q=" + tencent)
+    def quote_of(tc):
+        text = fetch("https://qt.gtimg.cn/q=" + tc)
         m = re.search(r'="([^"]*)"', text)
         if not m or len(m.group(1).split("~")) < 50:
             raise ApiError("未获取到该代码的行情，请确认代码是否存在")
         f = m.group(1).split("~")
-        price = to_num(f[3], 0) or 0
-        prev = to_num(f[4], 0) or 0
-        change = to_num(f[31], 0) or 0
-        pct = to_num(f[32], 0) or 0
+        digits = tc[2:]
+        sfx = {"sh": "SH", "sz": "SZ", "bj": "BJ"}[tc[:2]]
+        # 指数代码特征：沪市 000xxx、深市 399xxx、北交所 899xxx
+        is_index = ((tc[:2] == "sh" and digits.startswith("000"))
+                    or (tc[:2] == "sz" and digits.startswith("399"))
+                    or (tc[:2] == "bj" and digits.startswith("899")))
+        vol = to_num(f[6], 0)          # 今日累计成交量（手）
         return {
-            "code": tencent if explicit else f[2],
+            # 显式前缀或跨市场回退时回传完整代码，前端回填后才能继续正确取分时/K线
+            "code": tc if (explicit or tc != tencent) else f[2],
             "name": f[1],
-            "market": {"sh": "上证", "sz": "深证", "bj": "北证"}[tencent[:2]],
-            "price": price,
-            "prev_close": prev,
+            "is_index": is_index,
+            "vol_yoy": _index_vol_yoy(tc) if is_index else None,
+            "market": {"sh": "上证", "sz": "深证", "bj": "北证"}[tc[:2]],
+            "price": to_num(f[3], 0) or 0,
+            "prev_close": to_num(f[4], 0) or 0,
+            "change": to_num(f[31], 0) or 0,
+            "pct": to_num(f[32], 0) or 0,
             "open": to_num(f[5], 0),
             "high": to_num(f[33], 0),
             "low": to_num(f[34], 0),
-            "change": change,
-            "pct": pct,
-            "volume": to_num(f[6], 0),          # 手
+            "volume": vol,                      # 手
             "amount": to_num(f[37], 0),         # 万元
             "turnover": to_num(f[38], 0),       # 换手率 %
             "pe": to_num(f[39]),
@@ -174,11 +241,58 @@ def api_quote(code):
             "pb": to_num(f[46]),
             "vol_ratio": to_num(f[49]) if len(f) > 49 else None,
             "time": f[30] if len(f) > 30 else "",
-            "suspended": price == 0,
-            "secucode": secucode,
+            "suspended": (to_num(f[3], 0) or 0) == 0,
+            "secucode": "%s.%s" % (digits, sfx),
         }
 
+    def build():
+        try:
+            return quote_of(tencent)
+        except ApiError:
+            if explicit:
+                raise
+            # 裸 6 位代码推断错市场时回退（如 000300 实为沪市沪深300，而非深市股票）
+            alt = ("sz" if tencent.startswith("sh") else "sh") + tencent[2:]
+            return quote_of(alt)
+
     return cached("quote:" + tencent, 5, build)
+
+
+# ---------------------------------------------------------------- 指数行情
+
+# 常用指数（顺序即前端快捷条展示顺序）
+INDEX_LIST = [
+    ("sh000001", "上证指数"),
+    ("sz399001", "深证成指"),
+    ("sz399006", "创业板指"),
+    ("sh000688", "科创50"),
+    ("sh000300", "沪深300"),
+    ("sh000905", "中证500"),
+    ("sh000016", "上证50"),
+    ("bj899050", "北证50"),
+]
+
+
+def api_indices():
+    """批量获取常用指数行情，一次上游请求即可。"""
+    def build():
+        text = fetch("https://qt.gtimg.cn/q=" + ",".join(c for c, _ in INDEX_LIST))
+        items = []
+        for code, fallback_name in INDEX_LIST:
+            m = re.search(r'v_%s="([^"]*)"' % code, text)
+            if not m:
+                continue
+            f = m.group(1).split("~")
+            if len(f) < 33:
+                continue
+            items.append({"code": code, "name": f[1] or fallback_name,
+                          "price": to_num(f[3], 0), "change": to_num(f[31], 0),
+                          "pct": to_num(f[32], 0)})
+        if not items:
+            raise ApiError("指数行情暂不可用")
+        return {"items": items}
+
+    return cached("indices", 10, build)
 
 
 # ---------------------------------------------------------------- 分时数据
@@ -424,8 +538,10 @@ def api_suggest(q):
                             pass
                     mk = parts[0].lower()
                     full = mk + parts[1] if mk in ("sh", "sz", "bj") else parts[1]
+                    kind = parts[4] if len(parts) > 4 else ""
                     items.append({"code": parts[1], "name": name,
-                                  "market": mk, "full": full})
+                                  "market": mk, "full": full,
+                                  "is_index": kind == "ZS"})
         return {"items": items[:8]}
 
     return cached("suggest:" + q, 600, build)
@@ -434,6 +550,81 @@ def api_suggest(q):
 # ---------------------------------------------------------------- 持仓监控
 
 WATCH_FILE = os.path.join(BASE_DIR, "watchlist.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+
+# ---------------------------------------------------------------- 开机自启
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "StockDesk"
+
+
+def _load_setting(key, default=None):
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get(key, default)
+    except Exception:
+        return default
+
+
+def _save_setting(key, value):
+    try:
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data[key] = value
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _autostart_cmd():
+    """注册表 Run 值：exe 以 --tray-only 启动（只常驻托盘，不打开界面）。"""
+    if getattr(sys, "frozen", False):
+        return '"%s" --tray-only' % sys.executable
+    return '"%s" "%s" --tray-only' % (sys.executable,
+                                      os.path.join(BASE_DIR, "server.py"))
+
+
+def _autostart_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            winreg.QueryValueEx(k, _AUTOSTART_NAME)
+        return True
+    except Exception:
+        return False
+
+
+def _set_autostart(on):
+    """写入/删除 HKCU Run 键（无需管理员权限）。返回设置后的实际状态。"""
+    try:
+        import winreg
+        if on:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                winreg.SetValueEx(k, _AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  _autostart_cmd())
+        else:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, _AUTOSTART_NAME)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return _autostart_enabled()
+
+
+def ensure_autostart():
+    """首次运行（exe 模式）默认开启开机自启；用户通过托盘菜单关闭后不再自动打开。"""
+    if not getattr(sys, "frozen", False):
+        return
+    pref = _load_setting("autostart")
+    if pref is None:                       # 首次运行：默认开启并记录偏好
+        _set_autostart(True)
+        _save_setting("autostart", True)
 
 
 class WatchState:
@@ -446,9 +637,24 @@ class WatchState:
 
     def find(self, code):
         for it in self.items:
-            if it["code"] == code:
+            if _same_code(it["code"], code):
                 return it
         return None
+
+
+def _code_key(code):
+    """代码比较键：(市场前缀, 6 位数字)。兼容 sh000300 / 000300 两种写法。"""
+    s = (code or "").strip().lower()
+    m = re.match(r"^(sh|sz|bj)?(\d{6})$", s)
+    if m:
+        return (m.group(1) or "", m.group(2))
+    return ("", re.sub(r"\D", "", s)[-6:])
+
+
+def _same_code(a, b):
+    pa, da = _code_key(a)
+    pb, db = _code_key(b)
+    return bool(da) and da == db and (not pa or not pb or pa == pb)
 
 
 WATCH = WatchState()
@@ -463,17 +669,24 @@ APP_URL = None         # 主窗口地址，托盘"打开主窗口"时使用
 
 
 def _load_watch():
-    """启动时恢复上次的持仓（watchlist.json）。"""
+    """启动时恢复上次的自选/持仓（watchlist.json）。
+
+    兼容两种存储格式：裸 6 位（601288）与带市场前缀（sh000300 / sh601288）。
+    指数必须有前缀（000300 会被误判为深市），统一归一化为 tencent 全码保存。
+    """
     try:
         with open(WATCH_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         for it in (raw if isinstance(raw, list) else []):
             code = str(it.get("code") or "")
-            if re.match(r"^\d{6}$", code):
-                shares = max(0.0, to_num(it.get("shares"), 0) or 0)
-                cost = max(0.0, to_num(it.get("cost"), 0) or 0)
-                WATCH.items.append({"code": code, "shares": shares,
-                                    "cost": cost, "quote": None})
+            try:
+                canonical, _, _ = normalize(code)     # 校验并补全市场前缀
+            except ApiError:
+                continue
+            shares = max(0.0, to_num(it.get("shares"), 0) or 0)
+            cost = max(0.0, to_num(it.get("cost"), 0) or 0)
+            WATCH.items.append({"code": canonical, "shares": shares,
+                                "cost": cost, "quote": None})
     except Exception:
         pass
 
@@ -513,6 +726,9 @@ def _item_view(it):
     return {
         "code": it["code"],
         "name": q.get("name") or it["code"],
+        "is_index": bool(q.get("is_index")),
+        "volume": q.get("volume") or 0.0,
+        "vol_yoy": q.get("vol_yoy"),
         "price": price,
         "pct": q.get("pct") or 0.0,
         "prev_close": prev,
@@ -533,7 +749,12 @@ def _watch_view():
     today = sum(i["today_pnl"] for i in items)
     hold = sum(i["hold_pnl"] for i in items)
     base = mv - today                     # 昨日市值
-    pct = (today / base * 100) if base else 0.0
+    if base:
+        pct = today / base * 100
+    else:
+        # 纯自选（含指数，未填股数）时按等权平均涨跌幅，托盘图标/标题才有意义
+        vals = [i["pct"] for i in items if i["pct"]]
+        pct = sum(vals) / len(vals) if vals else 0.0
     return {
         "items": items,
         "totals": {"market_value": round(mv, 2), "today_pnl": round(today, 2),
@@ -543,12 +764,24 @@ def _watch_view():
 
 
 def _tray_tip(items, totals):
-    """托盘悬停提示：每行 `名称 涨跌幅 单日收益`（无持仓时只显示名称与涨跌幅）。上限 127 字符。"""
+    """托盘悬停提示，每行带现价：
+    个股：`名称 现价 涨跌幅 单日收益`（无持仓则省略收益）
+    指数：`名称 现价 涨跌 成交量 同比y%`（涨跌为点数，负数自带 -；同比同理）。上限 127 字符。"""
     body = []
     for it in items:
-        line = "%s %+.2f%%" % (it["name"][:8], it["pct"])
-        if it["shares"]:
-            line += " %s" % _pnl_plain(it["today_pnl"])
+        price = it.get("price") or 0.0
+        name = it["name"][:8]
+        px = ("%.2f" % price) if price else "--"
+        if it.get("is_index") and not it["shares"]:
+            chg = price - (it.get("prev_close") or price)
+            line = "%s %s %+.2f %s" % (name, px, chg, _vol_plain(it.get("volume")))
+            yoy = it.get("vol_yoy")
+            if yoy is not None:
+                line += " 同比%.1f%%" % yoy
+        else:
+            line = "%s %s %+.2f%%" % (name, px, it["pct"])
+            if it["shares"]:
+                line += " %s" % _pnl_plain(it["today_pnl"])
         body.append(line)
 
     def build(shown):
@@ -661,9 +894,8 @@ def watch_add(code, shares="0", cost="0"):
 
 
 def watch_remove(code):
-    digits = re.sub(r"\D", "", code or "")[-6:]
     with WATCH.lock:
-        WATCH.items[:] = [i for i in WATCH.items if i["code"] != digits]
+        WATCH.items[:] = [i for i in WATCH.items if not _same_code(i["code"], code)]
         WATCH.updated = time.time()
     _save_watch()
     return _refresh_watch()
@@ -714,17 +946,22 @@ def _tray_menu_items():
         n = len(WATCH.items)
     if n:
         items.append((2, "清空自选（%d 只）" % n))
-    if items:
-        items.append((None, None))
+    items.append((4, "开机自启：%s" % ("已开启" if _autostart_enabled() else "未开启")))
+    items.append((None, None))
     items.append((3, "退出"))
     return items
 
 
+_last_open = 0.0          # 上次开窗时间（冷却用）
+_open_lock = threading.Lock()
+
+
 def _tray_open():
-    """托盘左键 / 菜单"打开主窗口"：窗口存在则恢复，否则重新打开。"""
+    """托盘左键 / 菜单"打开主窗口"：窗口存在则恢复，否则重新打开（冷却由 open_window 统一控制）。"""
     if taskbar and taskbar.app_alive():
         taskbar.restore_app_window()
-    elif APP_URL:
+        return
+    if APP_URL:
         open_window(APP_URL)
 
 
@@ -735,6 +972,10 @@ def _tray_menu(action):
         watch_clear()
     elif action == 3:
         _tray_exit()
+    elif action == 4:
+        on = not _autostart_enabled()
+        _set_autostart(on)
+        _save_setting("autostart", on)   # 记录偏好：关闭后重启不再自动打开
 
 
 def _tray_exit():
@@ -763,6 +1004,7 @@ def _flag(value):
 ROUTES = {
     "/api/health": lambda q: {"app": "StockDesk", "version": APP_VERSION},
     "/api/quote": lambda q: api_quote(q.get("code", [""])[0]),
+    "/api/indices": lambda q: api_indices(),
     "/api/minute": lambda q: api_minute(q.get("code", [""])[0]),
     "/api/kline": lambda q: api_kline(q.get("code", [""])[0], q.get("days", ["320"])[0]),
     "/api/profile": lambda q: api_profile(q.get("code", [""])[0]),
@@ -796,8 +1038,25 @@ class Handler(SimpleHTTPRequestHandler):
             self._serve_api(parsed.path, urllib.parse.parse_qs(parsed.query))
             return
         if parsed.path in ("/", "/index.html"):
-            self.path = "/index.html"
+            self._serve_index()
+            return
         return super().do_GET()
+
+    def _serve_index(self):
+        """返回主页：把页面内的 __APP_VERSION__ 占位符替换为服务端实际版本，
+        保证版本自检单一数据源，杜绝"页面常量落后于服务端版本"导致的无限刷新。"""
+        try:
+            with open(os.path.join(STATIC_DIR, "index.html"), "rb") as f:
+                body = f.read().replace(b"__APP_VERSION__", APP_VERSION.encode("utf-8"))
+        except Exception:
+            self.send_error(500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -916,9 +1175,18 @@ def close_stale_app_windows():
 
 
 def open_window(url):
-    """以无地址栏的应用窗口打开，获得原生桌面程序观感。"""
-    global APP_ISOLATED
-    edge_paths = [
+    """以无地址栏的应用窗口打开，获得原生桌面程序观感。
+
+    加锁 + 4 秒冷却：Edge 窗口从发起启动到真正出现约需 1~3 秒，
+    期间 app_alive() 仍为 False，托盘快速连点/双击会重复 Popen 导致开多个窗口；
+    冷却期内所有重复调用直接忽略（启动开窗与托盘开窗统一走这里）。
+    """
+    global _last_open, APP_ISOLATED
+    with _open_lock:
+        if time.monotonic() - _last_open < 4:
+            return                      # 冷却期内：窗口正在打开，忽略重复调用
+        _last_open = time.monotonic()
+        edge_paths = [
         os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
         os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
     ]
@@ -966,7 +1234,9 @@ def main():
             _refresh_watch()
         else:
             TICKER.show_idle()           # 启动即常驻任务栏
-    if "--no-window" not in sys.argv:
+    ensure_autostart()                   # 首次运行默认开启开机自启
+    # --no-window：开发/测试用；--tray-only：开机自启用，仅常驻托盘不打开界面
+    if "--no-window" not in sys.argv and "--tray-only" not in sys.argv:
         close_stale_app_windows()        # 先关掉旧窗口，Edge 才不会聚焦旧页面
         threading.Timer(1.0, lambda: open_window(url)).start()
     try:
